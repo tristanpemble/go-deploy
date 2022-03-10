@@ -1,0 +1,64 @@
+# go-deploy
+
+```
+go-deploy is a tarball deployment tool.
+
+Usage:
+
+  go-deploy [option...] <tarball> <uri...>
+
+Details:
+
+  go-deploy uses SSH, Goroutines and a time tested deployment method to atomically deploy tarballs (the old school way)
+  to multiple servers in parallel. You pass in a tarball and a list of URIs, with paths, and the tool will SCP the
+  tarball to the server, untar it, and atomically replace a symlink to the newest release. It automatically prunes old
+  releases, while holding onto a configurable number of the most recent.  The folder structure created by go-deploy
+  looks like this:
+
+	.
+	├── current -> ./releases/31e750f5-36ef-4205-9963-df79e1760777
+	├── previous -> ./releases/542bcb06-b06f-4719-8ee5-7d32793f6b1b.
+	├── releases
+	│   ├── 31e750f5-36ef-4205-9963-df79e1760777
+	│   │   └── ...
+	│   ├── 4d1e2235-2d7a-495c-97ae-d3b88849b79f
+	│   │   └── ...
+	│   ├── 542bcb06-b06f-4719-8ee5-7d32793f6b1b
+	│   │   └── ...
+	│   ├── 81892b04-b6fe-4164-85b1-5c192a86e66c
+	│   │   └── ...
+	│   └── bdf655f6-291f-478d-a56b-648890b57e99
+	│       └── ...
+	└── shared
+
+  go-deploy is designed to be dead simple, very fast, and quite reliable. It is inspired by Capistrano.
+
+Customization:
+
+  go-deploy can be customized by placing special files in a top-level folder of your releases named ".go-deploy". These
+  files can influence the behavior of deploys.
+
+  shared
+	A list of files that will be replaced with symlinks to a "shared" folder.
+
+  pre-hook
+	A hook that is run immediately before symlinks are swapped.
+
+  post-hook
+	A hook that is run immediately after symlinks are swapped.
+
+Options:
+
+      --help        Displays this help text
+      --id string   A unique release ID (default "<uuid>")
+      --keep int    The number of releases to keep behind in the releases folder (default 5)
+
+Arguments:
+
+  <tarball>
+	The path to the tarball you will be deploying.
+  <uri...>
+	A list of RFC 3986 URIs to deploy to (e.g. ssh://ec2-user@example.com/path/to/release), where "ssh" is the only
+	valid protocol.
+
+```
