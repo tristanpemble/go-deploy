@@ -13,6 +13,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -25,6 +26,7 @@ var source string
 var releaseId string
 var keep int
 var hosts []url.URL
+var debug bool
 
 func init() {
 	flag.Usage = func() {
@@ -92,7 +94,7 @@ Arguments:
 
 	flag.StringVar(&releaseId, "id", "<uuid>", "A unique release ID")
 	flag.IntVar(&keep, "keep", 5, "The number of releases to keep behind in the releases folder")
-	flag.Bool("help", false, "Displays this help text")
+	flag.BoolVar(&debug, "debug", false, "Enable debug output")
 	flag.Parse()
 
 	if flag.NArg() < 2 {
@@ -132,6 +134,10 @@ Arguments:
 
 	if releaseId == "<uuid>" {
 		releaseId = uuid.NewString()
+	}
+
+	if debug {
+		log.SetLevel(log.DebugLevel)
 	}
 }
 
@@ -185,7 +191,7 @@ func deployTo(host url.URL, preDeploy *sync.WaitGroup) error {
 		return err
 	}
 	defer func(client *ssh.Client, path string) {
-		logger.Info("cleaning temp")
+		logger.Info("pruning temp")
 		_ = safeRm(client, path)
 	}(client, tmpPath)
 
@@ -216,6 +222,10 @@ func deployTo(host url.URL, preDeploy *sync.WaitGroup) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		logger.Info("pruning releases")
+		_ = pruneReleases(client, releaseRoot)
+	}()
 
 	logger.Info("running post-hook")
 	err = runHook(client, releasePath, "post-hook")
@@ -223,13 +233,185 @@ func deployTo(host url.URL, preDeploy *sync.WaitGroup) error {
 		return err
 	}
 
-	logger.Info("cleaning up old releases")
-	err = cleanupOldReleases(client, releaseRoot)
+	return nil
+}
+
+func createFolderHierarchy(client *ssh.Client, releaseRoot string) error {
+	paths := []string{
+		releaseRoot,
+		path.Join(releaseRoot, "tmp"),
+		path.Join(releaseRoot, "shared"),
+		path.Join(releaseRoot, "releases"),
+		path.Join(releaseRoot, "releases", releaseId),
+	}
+
+	for _, p := range paths {
+		err := makePath(client, p)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func symlinkSharedFiles(client *ssh.Client, releasePath string, sharedPath string) error {
+	sharedFiles, err := listSharedFiles(client, releasePath)
+
 	if err != nil {
 		return err
 	}
 
+	for _, filePath := range sharedFiles {
+		err = symlinkSharedFile(client, releasePath, sharedPath, filePath)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+func listSharedFiles(client *ssh.Client, releasePath string) ([]string, error) {
+	stdout, _, err := runCommand(client,
+		"cat %s",
+		shellescape.Quote(path.Join(releasePath, ".go-deploy", "shared")),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	return lines, scanner.Err()
+}
+
+func symlinkSharedFile(client *ssh.Client, releasePath string, sharedPath string, filePath string) error {
+	err := safeRm(client, path.Join(releasePath, filePath))
+	if err != nil {
+		return err
+	}
+
+	_, _, err = runCommand(client,
+		"mkdir -p $(dirname %s) && ln -s %s %s",
+		shellescape.Quote(path.Join(releasePath, filePath)),
+		shellescape.Quote(path.Join(sharedPath, filePath)),
+		shellescape.Quote(path.Join(releasePath, filePath)),
+	)
+
+	return err
+}
+
+func makePath(client *ssh.Client, target string) error {
+	_, _, err := runCommand(client,
+		"mkdir -p %s && touch %s",
+		shellescape.Quote(target),
+		shellescape.Quote(target),
+	)
+
+	return err
+}
+
+func untarFile(client *ssh.Client, tarPath string, releasePath string) error {
+	_, _, err := runCommand(client,
+		"/usr/bin/env tar xf %s --strip-components=1 -C %s",
+		shellescape.Quote(tarPath),
+		shellescape.Quote(releasePath+"/"),
+	)
+
+	return err
+}
+
+func runHook(client *ssh.Client, releasePath string, hookName string) error {
+	_, _, err := runCommand(client,
+		"cd %s ; if [ -f %s ] ; then exec %s ; fi",
+		shellescape.Quote(releasePath),
+		path.Join(releasePath, ".go-deploy", hookName),
+		path.Join(releasePath, ".go-deploy", hookName),
+	)
+
+	return err
+}
+
+func swapSymlinks(client *ssh.Client, releaseRoot string, releasePath string) error {
+	previousLnPath := path.Join(releaseRoot, "previous")
+	currentLnPath := path.Join(releaseRoot, "current")
+	tmpLnPath := path.Join(releaseRoot, "current.new")
+
+	_, _, err := runCommand(client,
+		"rm %s ; cp -P %s %s ; ln -s %s %s && mv -T %s %s",
+		shellescape.Quote(previousLnPath),
+		shellescape.Quote(currentLnPath),
+		shellescape.Quote(previousLnPath),
+		shellescape.Quote(releasePath),
+		shellescape.Quote(tmpLnPath),
+		shellescape.Quote(tmpLnPath),
+		shellescape.Quote(currentLnPath),
+	)
+
+	return err
+}
+
+func pruneReleases(client *ssh.Client, releaseRoot string) error {
+	releases, err := findReleases(client, releaseRoot)
+
+	if err != nil {
+		return err
+	}
+
+	if len(releases) < keep {
+		return nil
+	}
+
+	for _, release := range releases[keep:] {
+		p := path.Join(releaseRoot, "releases", release)
+
+		err = safeRm(client, p)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func findReleases(client *ssh.Client, root string) ([]string, error) {
+	stdout, _, err := runCommand(client,
+		"ls -1t %s",
+		shellescape.Quote(path.Join(root, "releases")),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(stdout)
+
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	return lines, scanner.Err()
+}
+
+func safeRm(client *ssh.Client, path string) error {
+	_, _, err := runCommand(client,
+		"if [ -f %s ] || [ -d %s ] ; then find %s -type f -delete -or -type l -delete ; fi && if [ -d %s ] ; then find %s -type d -delete ; fi",
+		shellescape.Quote(path),
+		shellescape.Quote(path),
+		shellescape.Quote(path),
+		shellescape.Quote(path),
+		shellescape.Quote(path),
+	)
+
+	return err
 }
 
 func makeClient(config url.URL) (*ssh.Client, error) {
@@ -292,300 +474,62 @@ func makeClient(config url.URL) (*ssh.Client, error) {
 	return client, nil
 }
 
-func createFolderHierarchy(client *ssh.Client, releaseRoot string) error {
-	paths := []string{
-		releaseRoot,
-		path.Join(releaseRoot, "tmp"),
-		path.Join(releaseRoot, "shared"),
-		path.Join(releaseRoot, "releases"),
-		path.Join(releaseRoot, "releases", releaseId),
-	}
-
-	for _, p := range paths {
-		err := makePath(client, p)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func symlinkSharedFiles(client *ssh.Client, releasePath string, sharedPath string) error {
-	sharedFiles, err := listSharedFiles(client, releasePath)
-
-	if err != nil {
-		return err
-	}
-
-	for _, filePath := range sharedFiles {
-		err = symlinkSharedFile(client, releasePath, sharedPath, filePath)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func listSharedFiles(client *ssh.Client, releasePath string) ([]string, error) {
-	session, err := client.NewSession()
-
-	if err != nil {
-		return nil, err
-	}
-
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	stdout, err := session.StdoutPipe()
-
-	if err != nil {
-		return nil, err
-	}
-
-	err = session.Run(fmt.Sprintf("cat %s", shellescape.Quote(path.Join(releasePath, ".go-deploy", "shared"))))
-
-	if err != nil {
-		return nil, err
-	}
-
-	lines := []string{}
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	return lines, scanner.Err()
-}
-
-func symlinkSharedFile(client *ssh.Client, releasePath string, sharedPath string, filePath string) error {
-	err := safeRm(client, path.Join(releasePath, filePath))
-
-	if err != nil {
-		return err
-	}
-
-	session, err := client.NewSession()
-	if err != nil {
-		return err
-	}
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	return session.Run(fmt.Sprintf(
-		"mkdir -p $(dirname %s) && ln -s %s %s",
-		shellescape.Quote(path.Join(releasePath, filePath)),
-		shellescape.Quote(path.Join(sharedPath, filePath)),
-		shellescape.Quote(path.Join(releasePath, filePath)),
-	))
-}
-
-func makePath(client *ssh.Client, target string) error {
-	session, err := client.NewSession()
-	if err != nil {
-		return err
-	}
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	return session.Run(fmt.Sprintf(
-		"mkdir -p %s && touch %s",
-		shellescape.Quote(target),
-		shellescape.Quote(target),
-	))
-}
-
-func untarFile(client *ssh.Client, tarPath string, releasePath string) error {
-	session, err := client.NewSession()
-	if err != nil {
-		return fmt.Errorf("failed opening ssh session: %s", err)
-	}
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	err = session.Run(fmt.Sprintf(
-		"/usr/bin/env tar xf %s --strip-components=1 -C %s",
-		shellescape.Quote(tarPath),
-		shellescape.Quote(releasePath+"/"),
-	))
-
-	if err != nil {
-		return fmt.Errorf("failed to untar the release: %s", err)
-	}
-
-	return nil
-}
-
-func runHook(client *ssh.Client, releasePath string, hookName string) error {
-	session, err := client.NewSession()
-
-	if err != nil {
-		return fmt.Errorf("failed opening ssh session: %s", err)
-	}
-
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	err = session.Run(fmt.Sprintf(
-		"cd %s ; if [ -f .%s ] ; then exec ./.%s ; fi",
-		shellescape.Quote(releasePath),
-		path.Join(releasePath, ".go-deploy", hookName),
-		path.Join(releasePath, ".go-deploy", hookName),
-	))
-
-	if err != nil {
-		return fmt.Errorf("failed running %s hook: %s", hookName, err)
-	}
-
-	return nil
-}
-
-func swapSymlinks(client *ssh.Client, releaseRoot string, releasePath string) error {
-	session, err := client.NewSession()
-
-	if err != nil {
-		return fmt.Errorf("failed opening ssh session: %s", err)
-	}
-
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	previousLnPath := path.Join(releaseRoot, "previous")
-	currentLnPath := path.Join(releaseRoot, "current")
-	tmpLnPath := path.Join(releaseRoot, "current.new")
-
-	err = session.Run(fmt.Sprintf(
-		"rm %s ; cp -P %s %s ; ln -s %s %s && mv -T %s %s",
-		shellescape.Quote(previousLnPath),
-		shellescape.Quote(currentLnPath),
-		shellescape.Quote(previousLnPath),
-		shellescape.Quote(releasePath),
-		shellescape.Quote(tmpLnPath),
-		shellescape.Quote(tmpLnPath),
-		shellescape.Quote(currentLnPath),
-	))
-
-	if err != nil {
-		return fmt.Errorf("failed to swap symlinks: %s", err)
-	}
-
-	return nil
-}
-
-func cleanupOldReleases(client *ssh.Client, releaseRoot string) error {
-	releases, err := findReleases(client, releaseRoot)
-
-	if err != nil {
-		return fmt.Errorf("failed to list releases: %s", err)
-	}
-
-	if len(releases) < keep {
-		return nil
-	}
-
-	for _, release := range releases[keep:] {
-		p := path.Join(releaseRoot, "releases", release)
-
-		err = safeRm(client, p)
-
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func findReleases(client *ssh.Client, root string) ([]string, error) {
-	session, err := client.NewSession()
-
-	if err != nil {
-		return nil, fmt.Errorf("failed opening ssh session: %s", err)
-	}
-
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	err = session.Run(fmt.Sprintf(
-		"ls -1t %s",
-		shellescape.Quote(path.Join(root, "releases")),
-	))
-	if err != nil {
-		return nil, err
-	}
-
-	var lines []string
-
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	return lines, scanner.Err()
-}
-
-func safeRm(client *ssh.Client, path string) error {
-	session, err := client.NewSession()
-
-	if err != nil {
-		return fmt.Errorf("failed opening ssh session: %s", err)
-	}
-
-	defer func(session *ssh.Session) {
-		_ = session.Close()
-	}(session)
-
-	err = session.Run(fmt.Sprintf(
-		"if [ -f %s ] || [ -d %s ] ; then find %s -type f -delete -or -type l -delete ; fi && if [ -d %s ] ; then find %s -type d -delete ; fi",
-		shellescape.Quote(path),
-		shellescape.Quote(path),
-		shellescape.Quote(path),
-		shellescape.Quote(path),
-		shellescape.Quote(path),
-	))
-
-	if err != nil {
-		return fmt.Errorf("failed to rm %s: %s", path, err)
-	}
-
-	return nil
-}
-
 func copyFile(sshClient *ssh.Client, source string, dest string) error {
 	client, err := scp.NewClientBySSH(sshClient)
 
 	if err != nil {
-		return fmt.Errorf("failed opening scp session: %s", err)
+		return err
 	}
 
 	err = client.Connect()
 	if err != nil {
-		return fmt.Errorf("failed to connect scp session: %s", err)
+		return err
 	}
 	defer client.Close()
 
 	f, err := os.Open(source)
-
+	if err != nil {
+		return err
+	}
 	defer func(f *os.File) {
 		_ = f.Close()
 	}(f)
 
-	err = client.CopyFromFile(context.Background(), *f, dest, "0440")
+	return client.CopyFromFile(context.Background(), *f, dest, "0440")
+}
 
+func runCommand(client *ssh.Client, format string, a ...interface{}) (io.Reader, io.Reader, error) {
+	session, err := client.NewSession()
 	if err != nil {
-		return fmt.Errorf("failed to copy file: %s", err)
+		return nil, nil, nil
+	}
+	defer func(session *ssh.Session) {
+		_ = session.Close()
+	}(session)
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return nil, nil, nil
 	}
 
-	return nil
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return nil, nil, nil
+	}
+
+	cmd := fmt.Sprintf(format, a...)
+	log.Debug(cmd)
+	err = session.Run(cmd)
+
+	if err != nil {
+		scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
+		var lines []string
+		for scanner.Scan() {
+			lines = append(lines, scanner.Text())
+		}
+
+		log.Error(strings.Join(lines, "\n"))
+	}
+
+	return stdout, stderr, err
 }
