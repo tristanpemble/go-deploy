@@ -1,6 +1,3 @@
-# go-deploy
-
-```
 go-deploy is a tarball deployment tool.
 
 Usage:
@@ -60,5 +57,3 @@ Arguments:
   <uri...>
 	A list of RFC 3986 URIs to deploy to (e.g. ssh://ec2-user@example.com/path/to/release), where "ssh" is the only
 	valid protocol.
-
-```
